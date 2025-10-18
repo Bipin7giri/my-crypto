@@ -49,15 +49,16 @@ export default function DashboardPage() {
   const [candles, setCandles] = useState<Candle[]>([]);
   const [showModal, setShowModal] = useState(false);
   const [activeTab, setActiveTab] = useState("portfolio");
-  const chartRef = useRef<HTMLDivElement>(null);
+  const [indicator, setIndicator] = useState<string>("none");
 
-  // 🔍 Fetch crypto suggestions
+  const chartContainerRef = useRef<HTMLDivElement>(null);
+  const chartRef = useRef<IChartApi | null>(null);
+  const candleSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
+
+  // 🔍 Suggestions
   useEffect(() => {
     const fetchSuggestions = async () => {
-      if (symbol.length < 2) {
-        setSuggestions([]);
-        return;
-      }
+      if (symbol.length < 2) return setSuggestions([]);
       try {
         const res = await axios.get(
           `https://api.coingecko.com/api/v3/search?query=${symbol}`
@@ -75,7 +76,7 @@ export default function DashboardPage() {
     return () => clearTimeout(delay);
   }, [symbol]);
 
-  // 💰 Live price updates
+  // 💰 Price updates
   useEffect(() => {
     const fetchPrices = async () => {
       const updated = await Promise.all(
@@ -107,7 +108,7 @@ export default function DashboardPage() {
     }
   }, [trades.length]);
 
-  // 🕯️ Fetch candle data for modal chart
+  // 🕯️ Candle data
   const fetchCandles = async (coin: string) => {
     try {
       const res = await axios.get(
@@ -128,19 +129,21 @@ export default function DashboardPage() {
     }
   };
 
-  // 🕯️ Chart render inside modal
+  // 📈 Chart + Indicators
   useEffect(() => {
-    if (!showModal || !chartRef.current || candles.length === 0) return;
-    chartRef.current.innerHTML = "";
-    const chart: IChartApi = createChart(chartRef.current, {
+    if (!showModal || candles.length === 0 || !chartContainerRef.current)
+      return;
+
+    chartContainerRef.current.innerHTML = "";
+    const chart = createChart(chartContainerRef.current, {
       layout: { background: { color: "#111" }, textColor: "#fff" },
       grid: { vertLines: { color: "#222" }, horzLines: { color: "#222" } },
-      width: chartRef.current.clientWidth,
-      height: 380,
+      width: chartContainerRef.current.clientWidth,
+      height: 520,
       timeScale: { borderColor: "#333", timeVisible: true },
     });
 
-    const candleSeries: ISeriesApi<"Candlestick"> = chart.addCandlestickSeries({
+    const candleSeries = chart.addCandlestickSeries({
       upColor: "#22c55e",
       borderUpColor: "#22c55e",
       wickUpColor: "#22c55e",
@@ -158,8 +161,192 @@ export default function DashboardPage() {
     }));
 
     candleSeries.setData(formatted);
+
+    // ====== INDICATORS ======
+
+    const prices = candles.map((c) => c.close);
+
+    // 📊 Moving Averages
+    const calcMA = (type: "sma" | "ema", period = 7) => {
+      const result: number[] = [];
+      if (type === "sma") {
+        for (let i = 0; i < prices.length; i++) {
+          if (i < period) result.push(NaN);
+          else
+            result.push(
+              prices.slice(i - period, i).reduce((a, b) => a + b, 0) / period
+            );
+        }
+      } else {
+        const k = 2 / (period + 1);
+        let emaPrev = prices[0];
+        for (let i = 0; i < prices.length; i++) {
+          emaPrev = prices[i] * k + emaPrev * (1 - k);
+          result.push(emaPrev);
+        }
+      }
+      return result;
+    };
+
+    // 📊 RSI
+    const calcRSI = (period = 14) => {
+      const gains: number[] = [];
+      const losses: number[] = [];
+      for (let i = 1; i < prices.length; i++) {
+        const diff = prices[i] - prices[i - 1];
+        gains.push(Math.max(0, diff));
+        losses.push(Math.max(0, -diff));
+      }
+      const avgGain =
+        gains.slice(0, period).reduce((a, b) => a + b, 0) / period;
+      const avgLoss =
+        losses.slice(0, period).reduce((a, b) => a + b, 0) / period;
+      let rs = avgGain / avgLoss;
+      const rsiValues: number[] = [100 - 100 / (1 + rs)];
+      for (let i = period; i < prices.length; i++) {
+        const gain = gains[i] || 0;
+        const loss = losses[i] || 0;
+        rs =
+          (avgGain * (period - 1) + gain) /
+          (avgLoss * (period - 1) + loss || 1);
+        rsiValues.push(100 - 100 / (1 + rs));
+      }
+      return rsiValues;
+    };
+
+    // 📊 MACD
+    const calcMACD = () => {
+      const ema12 = calcMA("ema", 12);
+      const ema26 = calcMA("ema", 26);
+      const macdLine = ema12.map((v, i) => v - ema26[i]);
+      const signal = calcMA("ema", 9);
+      const histogram = macdLine.map((v, i) => v - signal[i]);
+      return { macdLine, signal, histogram };
+    };
+
+    // 📊 Bollinger Bands
+    const calcBollinger = (period = 20, mult = 2) => {
+      const ma = calcMA("sma", period);
+      const bands = prices.map((p, i) => {
+        if (i < period) return { upper: NaN, lower: NaN };
+        const slice = prices.slice(i - period, i);
+        const mean = ma[i];
+        const variance =
+          slice.reduce((acc, val) => acc + Math.pow(val - mean, 2), 0) / period;
+        const std = Math.sqrt(variance);
+        return { upper: mean + mult * std, lower: mean - mult * std };
+      });
+      return { ma, bands };
+    };
+
+    // 🎯 Apply Selected Indicator
+    if (indicator === "sma" || indicator === "ema") {
+      const maValues = calcMA(indicator as "sma" | "ema");
+      const lineSeries = chart.addLineSeries({
+        color: indicator === "sma" ? "#60a5fa" : "#f59e0b",
+        lineWidth: 2,
+      });
+      lineSeries.setData(
+        maValues.map((v, i) => ({
+          time: Math.floor(
+            new Date(candles[i].date).getTime() / 1000
+          ) as UTCTimestamp,
+          value: v,
+        }))
+      );
+    }
+
+    if (indicator === "rsi") {
+      const rsi = calcRSI();
+      const rsiSeries = chart.addLineSeries({
+        color: "#34d399",
+        lineWidth: 2,
+        title: "RSI",
+      });
+      rsiSeries.setData(
+        rsi.map((v, i) => ({
+          time: Math.floor(
+            new Date(candles[i].date).getTime() / 1000
+          ) as UTCTimestamp,
+          value: v,
+        }))
+      );
+    }
+
+    if (indicator === "macd") {
+      const { macdLine, signal } = calcMACD();
+      const macdSeries = chart.addLineSeries({
+        color: "#818cf8",
+        lineWidth: 2,
+      });
+      const signalSeries = chart.addLineSeries({
+        color: "#f97316",
+        lineWidth: 2,
+      });
+      macdSeries.setData(
+        macdLine.map((v, i) => ({
+          time: Math.floor(
+            new Date(candles[i].date).getTime() / 1000
+          ) as UTCTimestamp,
+          value: v,
+        }))
+      );
+      signalSeries.setData(
+        signal.map((v, i) => ({
+          time: Math.floor(
+            new Date(candles[i].date).getTime() / 1000
+          ) as UTCTimestamp,
+          value: v,
+        }))
+      );
+    }
+
+    if (indicator === "bollinger") {
+      const { ma, bands } = calcBollinger();
+      const upperSeries = chart.addLineSeries({
+        color: "#f87171",
+        lineWidth: 1,
+      });
+      const lowerSeries = chart.addLineSeries({
+        color: "#60a5fa",
+        lineWidth: 1,
+      });
+      const maSeries = chart.addLineSeries({
+        color: "#a3a3a3",
+        lineWidth: 1,
+      });
+      upperSeries.setData(
+        bands.map((b, i) => ({
+          time: Math.floor(
+            new Date(candles[i].date).getTime() / 1000
+          ) as UTCTimestamp,
+          value: b.upper,
+        }))
+      );
+      lowerSeries.setData(
+        bands.map((b, i) => ({
+          time: Math.floor(
+            new Date(candles[i].date).getTime() / 1000
+          ) as UTCTimestamp,
+          value: b.lower,
+        }))
+      );
+      maSeries.setData(
+        ma.map((v, i) => ({
+          time: Math.floor(
+            new Date(candles[i].date).getTime() / 1000
+          ) as UTCTimestamp,
+          value: v,
+        }))
+      );
+    }
+
     chart.timeScale().fitContent();
-  }, [candles, showModal]);
+
+    chartRef.current = chart;
+    candleSeriesRef.current = candleSeries;
+    return () => chart.remove();
+  }, [candles, showModal, indicator]);
 
   // ➕ Add trade
   const addTrade = () => {
@@ -287,9 +474,9 @@ export default function DashboardPage() {
                 </p>
               </div>
               <button
-                onClick={() => {
+                onClick={async () => {
                   setSelectedSymbol(t.name);
-                  fetchCandles(t.name);
+                  await fetchCandles(t.name);
                   setShowModal(true);
                 }}
                 className="ml-3 text-gray-500 active:scale-90"
@@ -300,34 +487,6 @@ export default function DashboardPage() {
           ))}
         </div>
       </main>
-
-      {/* Bottom nav */}
-      <nav className="fixed bottom-0 w-full bg-white border-t border-gray-200 py-2 flex justify-around items-center shadow-sm">
-        <button
-          onClick={() => setActiveTab("portfolio")}
-          className={`flex flex-col items-center text-xs ${
-            activeTab === "portfolio" ? "text-gray-900" : "text-gray-400"
-          }`}
-        >
-          <BarChart3 className="w-6 h-6" />
-          Portfolio
-        </button>
-        <button
-          onClick={() => setActiveTab("add")}
-          className="bg-gray-900 text-white rounded-full p-3 active:scale-95 transition"
-        >
-          <PlusCircle className="w-5 h-5" />
-        </button>
-        <button
-          onClick={() => setActiveTab("settings")}
-          className={`flex flex-col items-center text-xs ${
-            activeTab === "settings" ? "text-gray-900" : "text-gray-400"
-          }`}
-        >
-          <Settings className="w-6 h-6" />
-          Settings
-        </button>
-      </nav>
 
       {/* Modal */}
       {showModal && (
@@ -342,7 +501,24 @@ export default function DashboardPage() {
             <h2 className="text-lg font-semibold text-white mb-3 text-center">
               {selectedSymbol.toUpperCase()} / USD
             </h2>
-            <div ref={chartRef} className="h-[380px] w-full" />
+
+            {/* Indicator Selector */}
+            <div className="flex justify-center mb-3">
+              <select
+                value={indicator}
+                onChange={(e) => setIndicator(e.target.value)}
+                className="bg-zinc-800 text-white px-3 py-2 rounded-lg text-sm border border-zinc-700"
+              >
+                <option value="none">None</option>
+                <option value="sma">Simple MA (7)</option>
+                <option value="ema">EMA (7)</option>
+                <option value="bollinger">Bollinger Bands</option>
+                <option value="rsi">RSI (14)</option>
+                <option value="macd">MACD</option>
+              </select>
+            </div>
+
+            <div ref={chartContainerRef} className="h-[520px] w-full" />
           </div>
         </div>
       )}
